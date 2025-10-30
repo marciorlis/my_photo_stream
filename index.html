@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minha Galeria de Fotos Social</title>
+    <!-- Carrega o Tailwind CSS para estilização rápida e responsiva -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7fafc; /* light gray background */
+        }
+        .ads-placeholder {
+            min-height: 100px;
+            background-color: #fff;
+            border: 2px dashed #f6ad55; /* Cor de atenção do Tailwind */
+            color: #d69e2e;
+        }
+        .photo-card {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            transition: transform 0.3s ease;
+        }
+        .photo-card:hover {
+            transform: translateY(-5px);
+        }
+        .votation-button {
+            transition: background-color 0.2s, transform 0.1s;
+        }
+        .votation-button:hover {
+            transform: scale(1.02);
+        }
+    </style>
+    <!-- Configuração do Firebase Imports -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, query, orderBy, onSnapshot, doc, updateDoc, setLogLevel, getDocs, addDoc, serverTimestamp, arrayUnion } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais (disponíveis no escopo do módulo)
+        let db, auth, userId, appId;
+        let photos = [];
+        let currentPhotoIndex = 0;
+        let isAuthReady = false;
+        let adminId = null; // NOVO: Armazena o ID do usuário que iniciou o aplicativo (O Admin)
+
+        // --- Variáveis Globais (MANDATÓRIAS) ---
+        
+        // NOVO: Verifica se estamos no ambiente Canvas.
+        const isCanvasEnvironment = typeof __firebase_config !== 'undefined';
+        
+        let configString = isCanvasEnvironment ? __firebase_config : 
+            // FALLBACK PARA TESTES LOCAIS: Configuração de MOCK para evitar o erro "projectId not provided".
+            // O Firestore NÂO funcionará, mas o app não irá falhar na inicialização.
+            '{"apiKey": "mockKey", "authDomain": "mockDomain", "projectId": "mock-gallery-project"}';
+            
+        const firebaseConfig = JSON.parse(configString);
+        
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        // Elementos UI
+        const photoDisplay = document.getElementById('photo-display');
+        const photoInfo = document.getElementById('photo-info');
+        const votationButton = document.getElementById('votation-button');
+        const loadingIndicator = document.getElementById('loading-indicator');
+        const messageBox = document.getElementById('message-box');
+        const messageText = document.getElementById('message-text');
+        const closeMessageButton = document.getElementById('close-message');
+        const submitPhotoForm = document.getElementById('submit-photo-form');
+        const adminSection = document.getElementById('admin-section'); // NOVO: Referência à seção admin
+
+        // Função de Mensagem Personalizada
+        function showMessage(message) {
+            messageText.textContent = message;
+            messageBox.classList.remove('hidden');
+        }
+        closeMessageButton.addEventListener('click', () => {
+            messageBox.classList.add('hidden');
+        });
+        
+        // NOVO: Atualiza a visibilidade da seção de administração e exibe o ID
+        function updateAdminUI() {
+            const userIdDisplay = document.getElementById('user-id-display');
+            if (userId === adminId) {
+                adminSection.classList.remove('hidden');
+                userIdDisplay.textContent = `Seu ID (ADMINISTRADOR): ${userId}`;
+            } else {
+                adminSection.classList.add('hidden');
+                userIdDisplay.textContent = `Seu ID (VISITANTE): ${userId}`;
+            }
+        }
+
+
+        // Função de Inicialização do Firebase
+        async function initializeFirebase() {
+            try {
+                // setLogLevel('Debug'); // Descomente para ver logs do Firestore
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                // Autenticação
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    // Força login anônimo para convidados ou em ambiente local (sem token)
+                    await signInAnonymously(auth);
+                }
+
+                // OBTÉM O USER ID APÓS A AUTENTICAÇÃO
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        
+                        // Lógica para definir o Admin ID:
+                        if (!adminId) {
+                            if (isCanvasEnvironment && initialAuthToken) {
+                                // 1. Se estiver no Canvas E tiver token: o dono é o Admin
+                                adminId = userId; 
+                                console.log("Admin ID definido (via token):", adminId);
+                            } else if (!isCanvasEnvironment) {
+                                // 2. Se estiver no Ambiente Local: o primeiro anônimo é o Admin para fins de teste.
+                                adminId = userId;
+                                console.log("Admin ID definido (Local Anônimo):", adminId);
+                                showMessage("Modo de teste local ativo. A conexão com o Firestore não funcionará sem sua configuração real.");
+                            }
+                        }
+                        
+                        isAuthReady = true;
+                        console.log("Usuário autenticado:", userId);
+                        
+                        // Habilita/desabilita a seção de administração
+                        updateAdminUI();
+
+                        // Inicia o listener de fotos após a autenticação
+                        listenForPhotos();
+                    } else {
+                        // Caso de fallback (usuário anônimo sem token)
+                        userId = crypto.randomUUID();
+                        isAuthReady = true;
+                        showMessage("Acesso anônimo. A seção de administração está oculta.");
+                        listenForPhotos();
+                    }
+                });
+
+            } catch (error) {
+                // Se cair aqui, a configuração do mock falhou ou há outro problema sério
+                console.error("Erro ao inicializar Firebase ou autenticar:", error);
+                loadingIndicator.textContent = "Erro ao carregar o aplicativo. Verifique o console.";
+                showMessage("Erro crítico de inicialização. Veja o console para detalhes.");
+            }
+        }
+
+        // --- Lógica de Dados (Fotos Públicas) ---
+
+        // Caminho da coleção pública
+        const getPublicPhotosCollectionRef = () => {
+            return collection(db, 'artifacts', appId, 'public', 'data', 'photos');
+        };
+
+        // Renderiza a foto atual
+        function renderCurrentPhoto() {
+            loadingIndicator.classList.add('hidden');
+            votationButton.disabled = false;
+            
+            if (photos.length === 0) {
+                photoDisplay.innerHTML = `
+                    <div class="flex items-center justify-center h-full text-gray-500 p-8 text-center">
+                        Nenhuma foto ainda! O Administrador precisa adicionar a primeira foto.
+                    </div>
+                `;
+                photoInfo.textContent = '';
+                votationButton.classList.add('hidden');
+                return;
+            }
+
+            votationButton.classList.remove('hidden');
+            const photo = photos[currentPhotoIndex];
+
+            // Renderiza a imagem e informações
+            photoDisplay.innerHTML = `
+                <img src="${photo.url}" 
+                     alt="Foto para Votação" 
+                     class="w-full h-auto object-contain rounded-lg max-h-[70vh] mx-auto transition-opacity duration-500"
+                     onerror="this.onerror=null;this.src='https://placehold.co/600x400/CCCCCC/333333?text=Erro+ao+Carregar+Imagem';"
+                >
+            `;
+            
+            photoInfo.innerHTML = `
+                <div class="text-center">
+                    <span class="text-xl font-bold text-gray-800">${photo.votes || 0} Gosto(s)</span>
+                    <p class="text-sm text-gray-500">Foto ${currentPhotoIndex + 1} de ${photos.length}</p>
+                    <p class="text-xs text-gray-400 mt-1">ID da Foto: ${photo.id}</p>
+                </div>
+            `;
+        }
+
+        // Avança para a próxima foto (ciclo)
+        function goToNextPhoto() {
+            currentPhotoIndex = (currentPhotoIndex + 1) % photos.length;
+            renderCurrentPhoto();
+        }
+
+        // Listener de Fotos (Real-time)
+        function listenForPhotos() {
+            if (!db || !isAuthReady) return;
+
+            // Ordena as fotos pelo timestamp (mais recente primeiro)
+            const q = query(getPublicPhotosCollectionRef(), orderBy('timestamp', 'desc'));
+
+            onSnapshot(q, (snapshot) => {
+                const newPhotos = [];
+                snapshot.forEach(doc => {
+                    newPhotos.push({ id: doc.id, ...doc.data() });
+                });
+                
+                photos = newPhotos;
+                
+                // Se o índice atual for inválido, reseta para 0
+                if (currentPhotoIndex >= photos.length && photos.length > 0) {
+                    currentPhotoIndex = 0;
+                } else if (photos.length === 0) {
+                    currentPhotoIndex = 0;
+                }
+
+                renderCurrentPhoto();
+                
+                // Atualiza a exibição do ID e visibilidade da seção admin
+                updateAdminUI();
+
+            }, (error) => {
+                console.error("Erro ao escutar fotos:", error);
+                showMessage("Erro ao carregar dados em tempo real.");
+            });
+        }
+
+        // Ação de Voto
+        votationButton.addEventListener('click', async () => {
+            if (!db || !isAuthReady || photos.length === 0) return;
+            votationButton.disabled = true;
+
+            const photoId = photos[currentPhotoIndex].id;
+            const photoRef = doc(getPublicPhotosCollectionRef(), photoId);
+            
+            try {
+                // Obtém a contagem de votos atualizada (garantindo precisão)
+                const currentVotes = photos.find(p => p.id === photoId)?.votes || 0;
+                
+                await updateDoc(photoRef, {
+                    votes: currentVotes + 1
+                });
+                
+                // MENSAGEM DE SUCESSO E TRANSIÇÃO
+                showMessage("Gostei registrado! Votos atualizados.");
+
+                // Vai para a próxima foto imediatamente após o voto
+                setTimeout(goToNextPhoto, 1500); // Dá um tempo para o usuário ver a atualização/mensagem
+
+            } catch (error) {
+                console.error("Erro ao registrar voto:", error);
+                showMessage("Erro ao votar. Verifique o console.");
+                votationButton.disabled = false;
+            }
+        });
+
+        // --- Lógica de Submissão de Foto (Administrativa) ---
+        submitPhotoForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            // NOVO: Checagem de segurança para garantir que apenas o Admin possa enviar
+            if (userId !== adminId) {
+                 showMessage("Permissão negada. Apenas o administrador original pode enviar fotos.");
+                 return;
+            }
+
+            if (!db || !isAuthReady) {
+                showMessage("Aguardando inicialização do sistema...");
+                return;
+            }
+
+            const urlInput = document.getElementById('photo-url-input');
+            const photoUrl = urlInput.value.trim();
+
+            if (!photoUrl) {
+                showMessage("Por favor, insira um URL de imagem válido.");
+                return;
+            }
+            
+            // Verificação básica de URL
+            if (!photoUrl.match(/\.(jpeg|jpg|gif|png|webp)/i)) {
+                 showMessage("O URL não parece ser uma imagem válida (jpeg, png, gif, webp).");
+                 return;
+            }
+
+            try {
+                // Adiciona a nova foto à coleção
+                await addDoc(getPublicPhotosCollectionRef(), {
+                    url: photoUrl,
+                    votes: 0,
+                    uploadedBy: userId, // Rastreia quem subiu a foto
+                    timestamp: serverTimestamp()
+                });
+
+                urlInput.value = ''; // Limpa o input
+                showMessage("Foto adicionada com sucesso e visível para todos!");
+
+            } catch (error) {
+                console.error("Erro ao adicionar foto:", error);
+                showMessage("Erro ao salvar a foto no Firestore. Verifique o console.");
+            }
+        });
+
+        // Inicia o aplicativo
+        initializeFirebase();
+
+    </script>
+</head>
+<body class="min-h-screen">
+    <div id="app-container" class="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+        
+        <!-- Cabeçalho -->
+        <header class="text-center mb-8">
+            <h1 class="text-4xl font-extrabold text-gray-900 mb-2">My Photo Stream</h1>
+            <p class="text-lg text-gray-600">Vote na foto que você mais gosta para desbloquear a próxima!</p>
+            <!-- A exibição do ID foi atualizada para mostrar se é ADMIN ou VISITANTE -->
+            <p id="user-id-display" class="text-xs text-gray-400 mt-2">ID do Usuário: Carregando...</p>
+        </header>
+
+        <!-- Mock do Adsense - Bloco de Anúncio -->
+        <div class="ads-placeholder w-full max-w-xl mx-auto flex items-center justify-center rounded-lg mb-8 p-4 text-center">
+            <div class="text-sm">
+                <!-- Este é um bloco de anúncio simulado para o Adsense -->
+                <p><strong>[Anúncio Google Adsense Simulada]</strong></p>
+                <p class="text-xs mt-1">Aqui você colocaria o código real do seu bloco de anúncios.</p>
+                <p class="text-xs">Tamanho Recomendado: 728x90 ou Bloco Responsivo</p>
+            </div>
+        </div>
+
+        <!-- Indicador de Carregamento -->
+        <div id="loading-indicator" class="text-center text-blue-500 font-semibold my-10">
+            Carregando dados do Firestore...
+        </div>
+
+        <!-- Seção Principal de Visualização e Votação -->
+        <main class="bg-white p-6 rounded-xl photo-card mb-8">
+            <!-- Display da Foto -->
+            <div id="photo-display" class="w-full bg-gray-100 rounded-lg flex items-center justify-center min-h-80 max-h-screen overflow-hidden">
+                <!-- O conteúdo será injetado pelo JavaScript -->
+            </div>
+
+            <div class="mt-6 flex flex-col sm:flex-row justify-between items-center space-y-4 sm:space-y-0">
+                <!-- Informações da Foto -->
+                <div id="photo-info" class="w-full sm:w-1/2">
+                    <!-- Informações de votos e contador serão injetadas aqui -->
+                </div>
+                
+                <!-- Botão de Votação/Avançar -->
+                <button id="votation-button" disabled
+                        class="votation-button w-full sm:w-auto px-8 py-3 bg-indigo-600 text-white font-semibold rounded-full shadow-lg hover:bg-indigo-700 disabled:opacity-50 flex items-center justify-center space-x-2">
+                    <!-- Ícone de coração (SVG) -->
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z" />
+                    </svg>
+                    <span>Gostar e Ver Próxima Foto</span>
+                </button>
+            </div>
+        </main>
+        
+        <!-- Mensagem Customizada (Substitui alert()) -->
+        <div id="message-box" class="fixed top-4 right-4 bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded shadow-md z-50 hidden" role="alert">
+            <span id="message-text" class="block sm:inline"></span>
+            <span class="absolute top-0 bottom-0 right-0 px-4 py-3 cursor-pointer" id="close-message">
+                <svg class="fill-current h-6 w-6 text-yellow-500" role="button" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><title>Close</title><path d="M14.348 14.849a1.2 1.2 0 0 1-1.697 0L10 11.697l-2.651 2.652a1.2 1.2 0 1 1-1.697-1.697l2.651-2.652-2.651-2.651a1.2 1.2 0 0 1 1.697-1.697L10 8.303l2.651-2.652a1.2 1.2 0 1 1 1.697 1.697l-2.651 2.651 2.651 2.652a1.2 1.2 0 0 1 0 1.697z"/></svg>
+            </span>
+        </div>
+
+        <!-- Formulário de Submissão de Fotos (Administrativa) -->
+        <!-- NOVO: Adicionado id="admin-section" e hidden por padrão. -->
+        <section id="admin-section" class="bg-white p-6 rounded-xl shadow-md mt-10 hidden">
+            <h2 class="text-2xl font-semibold text-gray-800 mb-4">Painel de Administrador: Adicionar Nova Foto (Somente URL)</h2>
+            <form id="submit-photo-form" class="space-y-4">
+                <div>
+                    <label for="photo-url-input" class="block text-sm font-medium text-gray-700">URL da Imagem:</label>
+                    <input type="url" id="photo-url-input" placeholder="https://exemplo.com/minha-foto.jpg" required 
+                           class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm">
+                </div>
+                <button type="submit" 
+                        class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-green-600 hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                    Enviar Foto
+                </button>
+            </form>
+        </section>
+
+    </div>
+</body>
+</html>
